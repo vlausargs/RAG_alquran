@@ -189,7 +189,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = convert_table_alquran_to_vector().await;
     }
 
-    // let _ = convert_table_alquran_to_vector().await;
     #[cfg(not(feature = "run_embeding_model"))]
     {
         let _ = search_db().await;
