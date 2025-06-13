@@ -1,0 +1,15 @@
+[package]
+name = "alquran_rag"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+run_embeding_model = []
+
+[dependencies]
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-async-std","runtime-async-std-rustls"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12.20", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+ollama-rs = "0.3.1"
+
