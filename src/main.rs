@@ -1,13 +1,25 @@
+use std::{
+    io::Write,
+    sync::{Arc, Mutex},
+};
+
 use ollama_rs::{
     Ollama,
     error::OllamaError,
-    generation::embeddings::{
-        GenerateEmbeddingsResponse,
-        request::{EmbeddingsInput, GenerateEmbeddingsRequest},
+    generation::{
+        chat::{ChatMessage, request::ChatMessageRequest},
+        completion::request::GenerationRequest,
+        embeddings::{
+            GenerateEmbeddingsResponse,
+            request::{EmbeddingsInput, GenerateEmbeddingsRequest},
+        },
     },
 };
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+
+use tokio::io::{self, AsyncWriteExt};
+use tokio_stream::StreamExt;
 
 #[derive(Deserialize, Serialize, Debug, sqlx::FromRow)]
 struct AlquranAyat {
@@ -20,7 +32,9 @@ struct AlquranAyat {
     en: String,
     tafsir: String,
 }
-const MODEL_NAME: &str = "nomic-embed-text";
+const TEXT_EMBED_MODEL_NAME: &str = "nomic-embed-text";
+const CHAT_MODEL_NAME: &str = "deepseek-r1:14b";
+
 async fn get_embedding_from_ayat(
     embed: &AlquranAyat,
 ) -> Result<GenerateEmbeddingsResponse, OllamaError> {
@@ -39,7 +53,7 @@ async fn get_embedding_from_ayat(
     println!("===============");
 
     let request: GenerateEmbeddingsRequest =
-        GenerateEmbeddingsRequest::new(MODEL_NAME.to_string(), input);
+        GenerateEmbeddingsRequest::new(TEXT_EMBED_MODEL_NAME.to_string(), input);
     let res = ollama.generate_embeddings(request).await.unwrap();
     Ok(res)
 }
@@ -101,12 +115,14 @@ async fn convert_table_alquran_to_vector() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-async fn search_db() -> Result<(), Box<dyn std::error::Error>> {
+async fn search_db(
+    search: &String,
+) -> Result<Vec<ResultQueryAlquranAyat>, Box<dyn std::error::Error>> {
     println!("RUNNING EMBEDDING QUERY");
     let pool = PgPoolOptions::new()
         .connect("postgres://alquran:alquran@127.0.0.1/alquran?currentSchema=alquran") // Update with your database credentials
         .await?;
-    let query = "search_query: explain about fasting".to_string();
+    let query = format!("search_query: {}", search).to_string();
 
     let vector_res = get_vector_from_query(&query).await;
 
@@ -122,11 +138,12 @@ async fn search_db() -> Result<(), Box<dyn std::error::Error>> {
                 , a.ayat
                 , a.tr
                 , a.idn
+                , a.en
                 , a.tafsir
-                , a.embedding <=> $1::vector as distance
+                , 1 - ( a.embedding <=> $1::vector) as distance
                 from alquran_ayat a 
                 join alquran_surah s on s.id = a.surah
-                order by a.embedding <=> $1::vector
+                order by 1-(a.embedding <=> $1::vector) desc
                 limit 5 
                 ",
             )
@@ -149,13 +166,13 @@ async fn search_db() -> Result<(), Box<dyn std::error::Error>> {
                 println!("\nTafsir {:?}", row.tafsir);
                 println!("===========================================\n");
             }
+            Ok(rows)
         }
         Err(e) => {
             println!("Error Query {:?}", e);
+            Err(Box::new(e))
         }
     }
-
-    Ok(())
 }
 
 #[derive(Deserialize, Serialize, Debug, sqlx::FromRow)]
@@ -166,6 +183,7 @@ struct ResultQueryAlquranAyat {
     ayat: i32,
     tr: String,
     idn: String,
+    en: String,
     tafsir: String,
     distance: f64,
 }
@@ -173,7 +191,7 @@ async fn get_vector_from_query(query: &String) -> Result<GenerateEmbeddingsRespo
     let ollama: Ollama = Ollama::default();
 
     let request: GenerateEmbeddingsRequest = GenerateEmbeddingsRequest::new(
-        MODEL_NAME.to_string(),
+        TEXT_EMBED_MODEL_NAME.to_string(),
         EmbeddingsInput::Single(format!("{}", query).to_lowercase()),
     );
     let res = ollama.generate_embeddings(request).await.unwrap();
@@ -181,9 +199,46 @@ async fn get_vector_from_query(query: &String) -> Result<GenerateEmbeddingsRespo
     Ok(res)
 }
 
+async fn genrate_response(query: &String, sim_res: Vec<ResultQueryAlquranAyat>) {
+    let ollama: Ollama = Ollama::default();
+    let remapped_context : Vec<String> = sim_res.iter().map(|f| {
+        format!("source surah: {}, source ayat: {}, translation in english: {} , translation in indonesia: {}, tafsir in indonesi: {}",f.surah,f.ayat,f.en,f.idn, f.tafsir)}
+    ).collect();
+    let request: ChatMessageRequest = ChatMessageRequest::new(
+        CHAT_MODEL_NAME.to_string(),
+        vec![
+            ChatMessage::user(
+                format!(
+                    "you are an agent that help people understand about islam. 
+                    strictly use context of islam as religion.
+                    here is some context {:?}
+                    strictly use only context above ignore other source.
+                    ",
+                    remapped_context
+                )
+                .to_string(),
+            ),
+            ChatMessage::user(format!("{}", query).to_string()),
+        ],
+    );
+    println!("GENERATING RESPONSE WITH INPUT {:?}", request);
+    let mut stream = ollama.send_chat_messages_stream(request).await.unwrap();
+
+    let mut stdout = std::io::stdout();
+    let mut final_response = String::new();
+    while let Some(res) = stream.next().await {
+        let responses = res.unwrap();
+        stdout
+            .write_all(responses.message.content.as_bytes())
+            .unwrap();
+        stdout.flush().unwrap();
+        final_response += responses.message.content.as_str();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("RUNNING THIS APP WITH MODEL {}", MODEL_NAME);
+    println!("RUNNING THIS APP WITH MODEL {}", TEXT_EMBED_MODEL_NAME);
     #[cfg(feature = "run_embeding_model")]
     {
         let _ = convert_table_alquran_to_vector().await;
@@ -191,7 +246,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(feature = "run_embeding_model"))]
     {
-        let _ = search_db().await;
+        let search = "explain about animal sacrefice".to_string();
+        let res = search_db(&search).await;
+        let sim_res: Vec<ResultQueryAlquranAyat> = res.unwrap();
+        genrate_response(&search, sim_res).await;
     }
     // Set up the database connection pool
 
